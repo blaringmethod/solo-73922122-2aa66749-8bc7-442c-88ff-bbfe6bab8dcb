@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>单据 #{{ d.id }}（炉次 {{ d.furnace }}）· 纸档补录</title>
+<style>
+  body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 24px; color: #222; }
+  h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; border-left: 4px solid #2b6cb0; padding-left: 8px; }
+  table { border-collapse: collapse; margin-top: 8px; }
+  th, td { border: 1px solid #cbd5e0; padding: 4px 10px; font-size: 14px; }
+  th { background: #ebf4ff; }
+  .card { border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px; margin-top: 8px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
+  .ok { background: #c6f6d5; } .bad { background: #fed7d7; } .warn { background: #feebc8; }
+  .flash-ok { background: #c6f6d5; } .flash-error { background: #fed7d7; } .flash-warn { background: #feebc8; }
+  .flash { padding: 8px 12px; border-radius: 6px; margin: 6px 0; font-size: 14px; }
+  button { padding: 4px 14px; cursor: pointer; }
+  input { padding: 3px 6px; width: 110px; }
+  .muted { color: #718096; font-size: 13px; }
+  .kind-paper { background: #e9d8fd; } .kind-old { background: #bee3f8; } .kind-none { background: #edf2f7; }
+</style>
+</head>
+<body>
+<h1>单据 #{{ d.id }} · 炉次 {{ d.furnace }}
+  {% if d.status == "ok" %}<span class="badge ok">可行</span>
+  {% else %}<span class="badge bad">证据冲突</span>{% endif %}
+  <a href="{{ url_for('index') }}"><button type="button">返回首页</button></a>
+</h1>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for cat, msg in messages %}
+    <div class="flash flash-{{ cat }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+<div class="card">
+  <b>开单参数（精确小数，区间含端点）：</b>
+  公差 [{{ d.params.tol_lo }}, {{ d.params.tol_hi }}]；
+  新表分辨率 {{ d.params.resolution }}（半步 {{ d.params.resolution }} / 2）；
+  零点偏差范围 [{{ d.params.zero_lo }}, {{ d.params.zero_hi }}]。
+  开单时间(UTC) {{ d.created_at }}。
+</div>
+
+{% set c = d.conclusion %}
+<h2>核查结论</h2>
+{% if c.feasible %}
+<div class="card">
+  <p>共同可行偏差：<b>[{{ c.feasible_lo }}, {{ c.feasible_hi }}]</b></p>
+  <p>固定件 {{ c.fixed_rows }} 条（其中超差 {{ c.fixed_bad }} 条，与偏差无关）；
+     自由件 {{ c.free_rows }} 条（其中恒超差 {{ c.always_bad_free }} 条，可合格 {{ c.free_rows - c.always_bad_free }} 条）。</p>
+  <table>
+    <tr><th>超差件数</th><th>件数</th><th>可达到该件数的偏差</th></tr>
+    <tr><td>最小值</td><td><b>{{ c.min_bad }}</b> 件</td><td>{{ c.min_bad_deviation }}</td></tr>
+    <tr><td>最大值</td><td><b>{{ c.max_bad }}</b> 件</td><td>{{ c.max_bad_deviation }}</td></tr>
+  </table>
+</div>
+{% else %}
+<div class="card">
+  <p class="bad"><b>无共同可行偏差：证据相互冲突，已撤下超差件数区间。</b></p>
+  <p class="muted">纸档仍已收录；请核对下列冲突约束对应的行并更正纸档。</p>
+  <table>
+    <tr><th>新表行号</th><th>新读数</th><th>证据值</th><th>证据类型</th><th>要求的偏差区间</th></tr>
+    {% for x in c.conflicts %}
+    <tr>
+      <td>{{ x.new_row_no }}</td><td>{{ x.reading }}</td><td>{{ x.evidence }}</td>
+      <td>{{ "纸档" if x.evidence_kind == "paper" else "配对旧值" }}</td>
+      <td>[{{ x.deviation_interval[0] }}, {{ x.deviation_interval[1] }}]</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<h2>按新表行号补录 / 更正纸档（与核查结论同一事务生效，写失败保留原状）</h2>
+<form method="post" action="{{ url_for('paper_add', order_id=d.id) }}">
+  新表行号 <input type="number" name="new_row_no" min="1" required>
+  纸档值 <input type="text" name="paper_value" placeholder="如 10.02" required>
+  <button type="submit">保存并重算</button>
+</form>
+<p class="muted">补录不属于本炉的行号也会收录进纸档台账，但不影响本单；再次对该炉开单时自动并入。</p>
+
+<h2>炉内行证据（{{ d.rows | length }} 行）</h2>
+<table>
+  <tr><th>新表行号</th><th>新表读数</th><th>配对旧值</th><th>纸档值</th><th>采用证据</th><th>证据类型</th></tr>
+  {% for r in d.rows %}
+  <tr>
+    <td>{{ r.new_row_no }}</td>
+    <td>{{ r.reading }}</td>
+    <td>{{ r.old_value if r.old_value is not none else "—" }}</td>
+    <td>{{ r.paper_value if r.paper_value is not none else "—" }}</td>
+    <td>{{ r.evidence if r.evidence is not none else "无（自由件）" }}</td>
+    <td><span class="badge kind-{{ r.evidence_kind }}">
+      {% if r.evidence_kind == "paper" %}纸档{% elif r.evidence_kind == "old" %}配对旧值{% else %}自由件{% endif %}
+    </span></td>
+  </tr>
+  {% endfor %}
+</table>
+
+</body>
+</html>

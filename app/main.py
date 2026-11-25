@@ -4,12 +4,12 @@ import os
 
 from flask import (
     Flask,
+    abort,
     flash,
     jsonify,
     redirect,
     render_template,
     request,
-    Response,
     url_for,
 )
 
@@ -36,7 +36,7 @@ def create_app(config=None):
     # ----------------------------------------------------------- 网页
 
     def html_view(fn):
-        """网页表单统一异常处理：失败回显 flash，状态保持不变。"""
+        """网页表单统一异常处理：失败回显 flash，事务已回滚、状态保持不变。"""
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
@@ -50,7 +50,25 @@ def create_app(config=None):
 
     @app.get("/")
     def index():
-        return render_template("index.html", state=services.get_state(get_db()))
+        conn = get_db()
+        state = services.get_state(conn)
+        furnaces = []
+        if state["furnace_col"]:
+            try:
+                furnaces = services.list_furnaces(conn)
+            except ServiceError:
+                furnaces = []
+        return render_template("index.html", state=state, furnaces=furnaces)
+
+    @app.get("/orders/<int:order_id>")
+    def order_page(order_id):
+        try:
+            detail = services.get_order_detail(get_db(), order_id)
+        except ServiceError as e:
+            if e.status == 404:
+                abort(404)
+            raise
+        return render_template("order.html", d=detail)
 
     @app.post("/upload")
     @html_view
@@ -62,73 +80,67 @@ def create_app(config=None):
         header, n_a, n_b = services.load_session(get_db(), fa, fb)
         flash(
             f"已加载：旧表 {n_a} 行、新表 {n_b} 行，共 {len(header)} 列。"
-            "此前会话（键、判定、供数）已重置。",
+            "此前会话（单据、纸档、结论）已重置。",
             "ok",
         )
 
     @app.post("/columns")
     @html_view
     def columns():
-        cols = request.form.getlist("columns")
-        services.set_columns(get_db(), cols)
-        flash(f"已保存 {len(cols)} 个备选列，请计算对照键。", "ok")
+        services.set_columns(
+            get_db(),
+            request.form.get("furnace_col", ""),
+            request.form.get("size_col", ""),
+            request.form.get("pair_col", ""),
+        )
+        flash("已保存炉次列、尺寸列与配对列。", "ok")
 
-    @app.post("/keys/compute")
+    @app.post("/orders")
     @html_view
-    def keys_compute():
-        key_ids, found = services.compute_keys(get_db())
-        if found:
+    def orders_open():
+        order_id, res = services.open_order(
+            get_db(),
+            request.form.get("furnace", ""),
+            request.form.get("tol_lo", ""),
+            request.form.get("tol_hi", ""),
+            request.form.get("resolution", ""),
+            request.form.get("zero_lo", ""),
+            request.form.get("zero_hi", ""),
+        )
+        if res.feasible:
             flash(
-                f"找到 {len(found)} 个列数最少（{len(found[0])} 列）的合规对照键："
-                + "；".join(" + ".join(c) for c in found),
+                f"炉次 {request.form.get('furnace')} 已开单（#{order_id}）："
+                f"超差件数 {res.min_bad}~{res.max_bad} 件。",
                 "ok",
             )
         else:
-            flash("所选备选列中不存在合规对照键，请调整备选列。", "error")
+            flash(
+                f"炉次 {request.form.get('furnace')} 已开单（#{order_id}）但证据冲突，"
+                "无共同可行偏差，已撤下件数区间。",
+                "warn",
+            )
 
-    @app.post("/keys/select")
-    @html_view
-    def keys_select():
-        services.select_key(get_db(), int(request.form["key_id"]))
-        flash("已选用对照键，开始供数，可下载行号对照表。", "ok")
-
-    @app.post("/judgments")
-    @html_view
-    def judgments_add():
-        info = services.register_judgment(
-            get_db(),
-            int(request.form["row_a"]),
-            int(request.form["row_b"]),
-            request.form["typ"],
-        )
-        flash(_judgment_flash("登记", info), "ok" if info["serving"] else "warn")
-
-    @app.post("/judgments/revoke")
-    @html_view
-    def judgments_revoke():
-        info = services.revoke_judgment(get_db(), int(request.form["judgment_id"]))
-        flash(_judgment_flash("撤销", info), "ok" if info["serving"] else "warn")
-
-    def _judgment_flash(action, info):
-        parts = [f"判定已{action}。"]
-        if info["invalidated"]:
-            parts.append("失效键：" + "、".join(f"#{k}" for k in info["invalidated"]) + "。")
-        if info["restored"]:
-            parts.append("恢复合规键：" + "、".join(f"#{k}" for k in info["restored"]) + "。")
-        parts.append("供数中。" if info["serving"] else "已停供，请另选合规键。")
-        return "".join(parts)
-
-    @app.get("/download.csv")
-    def download():
+    @app.post("/orders/<int:order_id>/paper")
+    def paper_add(order_id):
         try:
-            cols, rows, filename = services.build_mapping(get_db())
+            touched, res = services.upsert_paper(
+                get_db(),
+                int(request.form["new_row_no"]),
+                request.form.get("paper_value", ""),
+                order_id,
+            )
         except ServiceError as e:
-            return Response(e.message, status=e.status, mimetype="text/plain; charset=utf-8")
-        return Response(
-            services.mapping_csv(cols, rows),
-            mimetype="text/csv; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
+            flash(e.message, "error")
+        else:
+            note = "已并入本炉" if touched else "已收录（该行不属于本炉，不影响本单结论）"
+            if res.feasible:
+                flash(
+                    f"纸档已保存并同事务重算：{note}；超差件数 {res.min_bad}~{res.max_bad} 件。",
+                    "ok",
+                )
+            else:
+                flash("纸档已保存，但重算后证据冲突，已撤下件数区间。", "warn")
+        return redirect(url_for("order_page", order_id=order_id))
 
     # ----------------------------------------------------------- JSON API
 
@@ -148,39 +160,85 @@ def create_app(config=None):
     @app.post("/api/columns")
     def api_columns():
         data = request.get_json(force=True)
-        services.set_columns(get_db(), list(data.get("columns", [])))
+        services.set_columns(
+            get_db(),
+            str(data.get("furnace_col", "")),
+            str(data.get("size_col", "")),
+            str(data.get("pair_col", "")),
+        )
         return jsonify(ok=True)
 
-    @app.post("/api/keys/compute")
-    def api_keys_compute():
-        key_ids, found = services.compute_keys(get_db())
-        return jsonify(ok=True, keys=[{"id": i, "cols": c} for i, c in zip(key_ids, found)])
+    @app.get("/api/furnaces")
+    def api_furnaces():
+        return jsonify(furnaces=services.list_furnaces(get_db()))
 
-    @app.post("/api/keys/select")
-    def api_keys_select():
+    @app.post("/api/orders")
+    def api_orders_open():
         data = request.get_json(force=True)
-        services.select_key(get_db(), int(data["key_id"]))
-        return jsonify(ok=True, serving=True)
-
-    @app.post("/api/judgments")
-    def api_judgments_add():
-        data = request.get_json(force=True)
-        info = services.register_judgment(
-            get_db(), int(data["row_a"]), int(data["row_b"]), str(data["type"])
+        order_id, res = services.open_order(
+            get_db(),
+            str(data.get("furnace", "")),
+            str(data.get("tol_lo", "")),
+            str(data.get("tol_hi", "")),
+            str(data.get("resolution", "")),
+            str(data.get("zero_lo", "")),
+            str(data.get("zero_hi", "")),
         )
-        return jsonify(ok=True, **info)
+        return jsonify(ok=True, order_id=order_id, conclusion=_result_payload(res))
 
-    @app.post("/api/judgments/revoke")
-    def api_judgments_revoke():
+    @app.get("/api/orders")
+    def api_orders():
+        return jsonify(orders=services.list_orders(get_db()))
+
+    @app.get("/api/orders/<int:order_id>")
+    def api_order_detail(order_id):
+        return jsonify(services.get_order_detail(get_db(), order_id))
+
+    @app.post("/api/orders/<int:order_id>/paper")
+    def api_paper(order_id):
         data = request.get_json(force=True)
-        info = services.revoke_judgment(get_db(), int(data["id"]))
-        return jsonify(ok=True, **info)
+        touched, res = services.upsert_paper(
+            get_db(),
+            int(data["new_row_no"]),
+            str(data.get("paper_value", "")),
+            order_id,
+        )
+        return jsonify(
+            ok=True, touched_order=touched, conclusion=_result_payload(res)
+        )
+
+    @app.get("/api/paper")
+    def api_paper_list():
+        return jsonify(paper_records=services.list_paper(get_db()))
 
     @app.get("/api/state")
     def api_state():
         return jsonify(services.get_state(get_db()))
 
     return app
+
+
+def _result_payload(res):
+    """audit.AuditResult → 可 JSON 序列化字典（Decimal 转字符串保精度）。"""
+    def s(x):
+        return None if x is None else str(x)
+
+    return {
+        "feasible": res.feasible,
+        "feasible_lo": s(res.feasible_lo),
+        "feasible_hi": s(res.feasible_hi),
+        "total": res.total,
+        "fixed_rows": res.fixed_rows,
+        "free_rows": res.free_rows,
+        "fixed_bad": res.fixed_bad,
+        "always_bad_free": res.always_bad_free,
+        "free_can_pass": res.free_can_pass,
+        "min_bad": res.min_bad,
+        "max_bad": res.max_bad,
+        "min_bad_deviation": s(res.min_bad_deviation),
+        "max_bad_deviation": s(res.max_bad_deviation),
+        "conflicts": res.conflicts,
+    }
 
 
 if __name__ == "__main__":

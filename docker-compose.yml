@@ -1,7 +1,7 @@
 services:
   web:
     build: .
-    image: qc-key-migration
+    image: qc-furnace-audit
     ports:
       - "8000:5000"
     environment:

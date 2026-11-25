@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>试片复测记录 · 迁库对照</title>
+<title>炉次试片 · 迁库尺寸超差核查</title>
 <style>
   body { font-family: "Microsoft YaHei", "PingFang SC", sans-serif; margin: 24px; color: #222; }
   h1 { font-size: 20px; } h2 { font-size: 16px; margin-top: 28px; border-left: 4px solid #2b6cb0; padding-left: 8px; }
@@ -12,17 +12,17 @@
   .card { border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px 16px; margin-top: 8px; }
   .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; }
   .ok { background: #c6f6d5; } .bad { background: #fed7d7; } .warn { background: #feebc8; }
-  .inuse { background: #bee3f8; }
   .flash-ok { background: #c6f6d5; } .flash-error { background: #fed7d7; } .flash-warn { background: #feebc8; }
   .flash { padding: 8px 12px; border-radius: 6px; margin: 6px 0; font-size: 14px; }
   button { padding: 4px 14px; cursor: pointer; }
-  input[type=number] { width: 90px; }
+  input, select { padding: 3px 6px; }
   .muted { color: #718096; font-size: 13px; }
   form.inline { display: inline; }
+  .params input { width: 80px; }
 </style>
 </head>
 <body>
-<h1>陶瓷质检迁库 · 试片复测记录对照</h1>
+<h1>陶瓷质检迁库 · 炉次试片尺寸超差核查</h1>
 
 {% with messages = get_flashed_messages(with_categories=true) %}
   {% for cat, msg in messages %}
@@ -31,18 +31,14 @@
 {% endwith %}
 
 <div class="card">
-  <b>状态：</b>
-  旧表 {{ state.n_a }} 行 / 新表 {{ state.n_b }} 行；
-  {% if state.current_key_id %}
-    在用键 <b>#{{ state.current_key_id }}</b>；
-    {% if state.can_download %}<span class="badge ok">供数中</span>
-    {% else %}<span class="badge bad">已停供（复核使在用键失效，请另选合规键）</span>{% endif %}
-  {% else %}
-    <span class="badge warn">未选键</span>
-  {% endif %}
+  <b>状态：</b>旧表 {{ state.n_a }} 行 / 新表 {{ state.n_b }} 行；
+  炉次列 <b>{{ state.furnace_col or "未选" }}</b>，
+  尺寸列 <b>{{ state.size_col or "未选" }}</b>，
+  配对列 <b>{{ state.pair_col or "未选（不配对）" }}</b>；
+  已开单据 <b>{{ state.orders | length }}</b> 张，纸档 <b>{{ state.paper_records | length }}</b> 条。
 </div>
 
-<h2>1. 上传两份同表头 CSV（每份 ≤ 20000 行；新上传将重置会话）</h2>
+<h2>1. 上传两份同表头 CSV（每份 ≤ 20000 行；新上传将重置全部单据与纸档）</h2>
 <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
   旧系统台账 <input type="file" name="file_a" accept=".csv" required>
   新系统台账 <input type="file" name="file_b" accept=".csv" required>
@@ -50,80 +46,102 @@
 </form>
 
 {% if state.header %}
-<h2>2. 勾选备选列（至多 10 个）并计算对照键</h2>
+<h2>2. 选择炉次列、尺寸列与配对列</h2>
 <form method="post" action="{{ url_for('columns') }}">
-  {% for c in state.header %}
-    <label style="margin-right:12px">
-      <input type="checkbox" name="columns" value="{{ c }}"
-             {% if c in state.selected_columns %}checked{% endif %}> {{ c }}
-    </label>
-  {% endfor %}
-  <button type="submit">保存备选列</button>
-</form>
-<form method="post" action="{{ url_for('keys_compute') }}" style="margin-top:6px">
-  <button type="submit">计算列数最少的合规对照键</button>
+  <p>炉次列
+    <select name="furnace_col" required>
+      {% for c in state.header %}
+      <option value="{{ c }}" {% if c == state.furnace_col %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+    尺寸列
+    <select name="size_col" required>
+      {% for c in state.header %}
+      <option value="{{ c }}" {% if c == state.size_col %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </p>
+  <p>配对列（同值配对旧值；可留空表示不配对，全部以纸档/自由件处理）
+    <select name="pair_col">
+      <option value="">— 不配对 —</option>
+      {% for c in state.header %}
+      <option value="{{ c }}" {% if c == state.pair_col %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </p>
+  <button type="submit">保存列选择</button>
 </form>
 {% endif %}
 
-{% if state["keys"] %}
-<h2>3. 候选对照键（合规且列数最少）</h2>
+{% if furnaces %}
+<h2>3. 按炉次开单（同一份在供对照；开单即固定该炉全部新读数与配对旧值）</h2>
 <table>
-  <tr><th>#</th><th>键列</th><th>列数</th><th>合规</th><th>操作</th></tr>
-  {% for k in state["keys"] %}
+  <tr><th>炉次值</th><th>新表行数</th><th>参数与开单</th></tr>
+  {% for f in furnaces %}
   <tr>
-    <td>{{ k.id }}</td>
-    <td>{{ k.cols | join(' + ') }}</td>
-    <td>{{ k.cols | length }}</td>
-    <td>{% if k.compatible %}<span class="badge ok">合规</span>{% else %}<span class="badge bad">失效</span>{% endif %}
-        {% if k.in_use %}<span class="badge inuse">在用</span>{% endif %}</td>
+    <td>{{ f.furnace }}</td>
+    <td>{{ f.rows }}</td>
     <td>
-      {% if k.compatible and not k.in_use %}
-      <form class="inline" method="post" action="{{ url_for('keys_select') }}">
-        <input type="hidden" name="key_id" value="{{ k.id }}">
-        <button type="submit">选用</button>
-      </form>
-      {% endif %}
-    </td>
-  </tr>
-  {% endfor %}
-</table>
-{% endif %}
-
-{% if state.n_a %}
-<h2>4. 复核判定（按两表行号登记 / 撤销）</h2>
-<form method="post" action="{{ url_for('judgments_add') }}">
-  旧表行号 <input type="number" name="row_a" min="1" max="{{ state.n_a }}" required>
-  新表行号 <input type="number" name="row_b" min="1" max="{{ state.n_b }}" required>
-  <select name="typ">
-    <option value="same">同次（键值须相同）</option>
-    <option value="diff">异次（键值须不同）</option>
-  </select>
-  <button type="submit">登记判定</button>
-</form>
-{% if state.judgments %}
-<table>
-  <tr><th>#</th><th>旧表行号</th><th>新表行号</th><th>判定</th><th>时间(UTC)</th><th></th></tr>
-  {% for j in state.judgments %}
-  <tr>
-    <td>{{ j.id }}</td><td>{{ j.row_a }}</td><td>{{ j.row_b }}</td>
-    <td>{{ j.typ_label }}</td><td>{{ j.created_at }}</td>
-    <td>
-      <form class="inline" method="post" action="{{ url_for('judgments_revoke') }}">
-        <input type="hidden" name="judgment_id" value="{{ j.id }}">
-        <button type="submit">撤销</button>
+      <form class="inline params" method="post" action="{{ url_for('orders_open') }}">
+        <input type="hidden" name="furnace" value="{{ f.furnace }}">
+        公差下限 <input type="text" name="tol_lo" value="9.95" required>
+        公差上限 <input type="text" name="tol_hi" value="10.05" required>
+        新表分辨率 <input type="text" name="resolution" value="0.1" required>
+        零点偏差范围 <input type="text" name="zero_lo" value="-0.05" required>
+        ~ <input type="text" name="zero_hi" value="0.05" required>
+        <button type="submit">开单</button>
       </form>
     </td>
   </tr>
   {% endfor %}
 </table>
-{% endif %}
+<p class="muted">全部按精确小数（Decimal）计算，区间均含端点；真值范围 = 新读数 − 偏差 ± 半分辨率。</p>
 {% endif %}
 
-<h2>5. 下载行号对照表（含单边记录）</h2>
-{% if state.can_download %}
-  <p><a href="{{ url_for('download') }}"><button>下载 mapping CSV</button></a></p>
-{% else %}
-  <p class="muted">当前不可下载：须先选用一个合规对照键（在用键被复核判定失效后会停供，另选可用键即恢复）。</p>
+{% if state.orders %}
+<h2>4. 已开单据与核查结论</h2>
+<table>
+  <tr>
+    <th>单号</th><th>炉次</th><th>行数</th><th>状态</th>
+    <th>共同可行偏差</th><th>超差件数最小值</th><th>超差件数最大值</th><th>操作</th>
+  </tr>
+  {% for o in state.orders %}
+  <tr>
+    <td>#{{ o.id }}</td>
+    <td>{{ o.furnace }}</td>
+    <td>{{ o.row_count }}</td>
+    <td>
+      {% if o.status == "ok" %}<span class="badge ok">可行</span>
+      {% else %}<span class="badge bad">冲突</span>{% endif %}
+    </td>
+    {% set c = o.conclusion %}
+    {% if c and c.feasible %}
+    <td>[{{ c.feasible_lo }}, {{ c.feasible_hi }}]</td>
+    <td>{{ c.min_bad }} 件（偏差 {{ c.min_bad_deviation }}）</td>
+    <td>{{ c.max_bad }} 件（偏差 {{ c.max_bad_deviation }}）</td>
+    {% else %}
+    <td colspan="3" class="muted">无共同可行偏差，件数区间已撤下
+      {% if c and c.conflicts %}；冲突约束 {{ c.conflicts | length }} 条（见单据页）{% endif %}
+    </td>
+    {% endif %}
+    <td><a href="{{ url_for('order_page', order_id=o.id) }}"><button type="button">打开 / 补录纸档</button></a></td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+{% if state.paper_records %}
+<h2>5. 纸档补录台账（按新表行号，并发补录不同行均保留）</h2>
+<table>
+  <tr><th>新表行号</th><th>纸档值</th><th>来源单据</th><th>更新时间(UTC)</th></tr>
+  {% for p in state.paper_records %}
+  <tr>
+    <td>{{ p.new_row_no }}</td><td>{{ p.paper_value }}</td>
+    <td>{% if p.source_order_id %}#{{ p.source_order_id }}{% else %}—{% endif %}</td>
+    <td>{{ p.updated_at }}</td>
+  </tr>
+  {% endfor %}
+</table>
 {% endif %}
 
 </body>
